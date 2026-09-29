@@ -1,0 +1,29 @@
+# Build ghcr.io/<owner>/prompt-guard on every push to main that changes apps/prompt-guard/ or its workflow files.
+# "Run workflow" on the Actions tab (workflow_dispatch) rebuilds it by hand.
+name: build prompt-guard
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/prompt-guard/**"
+      - ".github/workflows/build-prompt-guard.yml"
+      - ".github/workflows/_build-image.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-prompt-guard
+  cancel-in-progress: false
+
+jobs:
+  build:
+    uses: ./.github/workflows/_build-image.yml
+    with:
+      app: prompt-guard
+    permissions:
+      contents: read
+      packages: write

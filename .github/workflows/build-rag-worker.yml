@@ -1,0 +1,29 @@
+# Build ghcr.io/<owner>/rag-worker on every push to main that changes apps/rag-worker/ or its workflow files.
+# "Run workflow" on the Actions tab (workflow_dispatch) rebuilds it by hand.
+name: build rag-worker
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/rag-worker/**"
+      - ".github/workflows/build-rag-worker.yml"
+      - ".github/workflows/_build-image.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-rag-worker
+  cancel-in-progress: false
+
+jobs:
+  build:
+    uses: ./.github/workflows/_build-image.yml
+    with:
+      app: rag-worker
+    permissions:
+      contents: read
+      packages: write
