@@ -35,7 +35,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: mcp-server
-          image: ghcr.io/OWNER/mcp-server:SHA
+          image: ghcr.io/mcs-bg/mcp-server:6dfc885
           command: ["opentelemetry-instrument", "python", "/app/server.py"]
           env:
             - name: PORT

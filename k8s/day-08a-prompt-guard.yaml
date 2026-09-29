@@ -44,7 +44,7 @@ spec:
           type: RuntimeDefault
       initContainers:
         - name: model
-          image: ghcr.io/OWNER/prompt-guard:SHA
+          image: ghcr.io/mcs-bg/prompt-guard:6dfc885
           command: ["python", "/app/download.py"]
           env:
             - name: HOME
@@ -85,7 +85,7 @@ spec:
               mountPath: /tmp
       containers:
         - name: prompt-guard
-          image: ghcr.io/OWNER/prompt-guard:SHA
+          image: ghcr.io/mcs-bg/prompt-guard:6dfc885
           command:
             - python
             - -m

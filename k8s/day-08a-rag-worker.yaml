@@ -37,7 +37,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: worker
-          image: ghcr.io/OWNER/rag-worker:SHA
+          image: ghcr.io/mcs-bg/rag-worker:6dfc885
           command: ["sleep", "infinity"]
           workingDir: /app
           env:
