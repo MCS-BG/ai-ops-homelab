@@ -1,10 +1,16 @@
-"""Chunk Markdown files, embed them with Ollama, and store them in pgvector."""
+"""Chunk Markdown files, embed them with Ollama, and store them in pgvector.
+
+Day 8b: run through opentelemetry-instrument, one ingest run is one "rag-ingest" trace in
+Langfuse, with one embedding observation per file.
+"""
 import glob
 import os
 import sys
 
 import psycopg
 import requests
+
+from llmtrace import observation, set_ollama_response, set_output
 
 OLLAMA = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11435")
 DSN = os.environ.get("PG_DSN", "host=127.0.0.1 port=15432 dbname=rag user=rag")  # password comes from PGPASSWORD
@@ -31,12 +37,17 @@ def chunk_markdown(text):
     return chunks
 
 
-def embed(texts):
-    r = requests.post(f"{OLLAMA}/api/embed",
-                      json={"model": EMBED_MODEL, "input": texts, "keep_alive": EMBED_KEEP_ALIVE},
-                      timeout=300)
-    r.raise_for_status()
-    return r.json()["embeddings"]
+def embed(texts, source=None):
+    with observation("ollama embed", "embedding", input={"source": source, "chunks": len(texts)},
+                     model=EMBED_MODEL, operation="embeddings") as span:
+        r = requests.post(f"{OLLAMA}/api/embed",
+                          json={"model": EMBED_MODEL, "input": texts, "keep_alive": EMBED_KEEP_ALIVE},
+                          timeout=300)
+        r.raise_for_status()
+        body = r.json()
+        set_ollama_response(span, body)
+        set_output(span, {"vectors": len(body["embeddings"])})
+        return body["embeddings"]
 
 
 def to_vector(values):
@@ -49,12 +60,14 @@ def main():
     if not files:
         sys.exit(f"No .md files found in {folder}")
 
-    with psycopg.connect(DSN) as conn:
+    with observation("rag-ingest", "chain", input={"folder": folder, "files": len(files)},
+                     trace_name="rag-ingest") as root, psycopg.connect(DSN) as conn:
+        total = 0
         for path in files:
             source = os.path.basename(path)
             with open(path, encoding="utf-8") as f:
                 chunks = chunk_markdown(f.read())
-            vectors = embed(["search_document: " + c for c in chunks])
+            vectors = embed(["search_document: " + c for c in chunks], source=source)
             with conn.cursor() as cur:
                 # Re-running replaces a file's chunks instead of duplicating them.
                 cur.execute("DELETE FROM chunks WHERE source = %s", (source,))
@@ -63,8 +76,9 @@ def main():
                     [(source, c, to_vector(v)) for c, v in zip(chunks, vectors)],
                 )
             conn.commit()
+            total += len(chunks)
             print(f"{source}: {len(chunks)} chunks stored")
-
+        set_output(root, {"files": len(files), "chunks": total})
 
 if __name__ == "__main__":
     main()

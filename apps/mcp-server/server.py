@@ -6,9 +6,20 @@ Tools:
   fo_get_entity_metadata  keys and fields of one entity set, from /data/$metadata
   fo_query                read-only OData query against the mock FO service
 
+Day 8b guardrails (Prompt Guard 2, http://prompt-guard.ai-lab.svc.cluster.local:8080/classify):
+  - before a tool runs, its user-supplied string arguments are classified; a malicious_score at or
+    above PROMPT_GUARD_THRESHOLD (default 0.5) refuses the call with a tool error
+  - after search_notes, every retrieved chunk is classified; flagged chunks are withheld
+    (indirect prompt injection), the rest are returned
+  - each check is a span with prompt_guard.* attributes and langfuse.observation.type=guardrail
+  - if Prompt Guard is unreachable the call is refused, unless PROMPT_GUARD_FAIL_OPEN=true
+The SDK's tools/call span (a TOOL observation in Langfuse) gets the arguments and result as
+input/output, and the Ollama embedding call is an "embedding" observation (model, token count).
+
 Transport: MCP Streamable HTTP on :8000 at /mcp (stateless, JSON responses).
 Built on the official MCP Python SDK 2.x, where FastMCP is named MCPServer.
 """
+import functools
 import os
 import re
 import xml.etree.ElementTree as ET
@@ -21,6 +32,10 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
+
+from opentelemetry import trace
+
+from llmtrace import _text, observation, set_ollama_response, set_output
 
 OLLAMA = os.environ.get("OLLAMA_URL", "http://ollama.ai-lab.svc.cluster.local:11434")
 DSN = os.environ.get("PG_DSN", "host=pgvector.ai-lab.svc.cluster.local port=5432 dbname=rag user=rag")  # password comes from PGPASSWORD
@@ -36,6 +51,12 @@ ALLOWED_HOSTS = [h.strip() for h in os.environ.get(
 ).split(",") if h.strip()]
 EDM = "{http://docs.oasis-open.org/odata/ns/edm}"
 
+PROMPT_GUARD_URL = os.environ.get("PROMPT_GUARD_URL", "http://prompt-guard.ai-lab.svc.cluster.local:8080/classify")
+# 0.5 = the argmax decision of Meta's two-class model (benign / malicious), as in the model card.
+PROMPT_GUARD_THRESHOLD = float(os.environ.get("PROMPT_GUARD_THRESHOLD", "0.5"))
+PROMPT_GUARD_ENABLED = os.environ.get("PROMPT_GUARD_ENABLED", "true").lower() == "true"
+PROMPT_GUARD_FAIL_OPEN = os.environ.get("PROMPT_GUARD_FAIL_OPEN", "false").lower() == "true"
+
 mcp = MCPServer(
     "ai-ops-homelab",
     instructions=(
@@ -43,25 +64,136 @@ mcp = MCPServer(
         "The fo_* tools read a MOCK Dynamics 365 finance and operations OData service with fake demo data "
         "(company usmf). Call fo_get_entity_metadata before fo_query to learn the exact field names."
     ),
-    version="0.8.0",
+    version="0.8.1",
 )
 
 
 # ---------- search_notes: same embedding and SQL as day 4 ask.py ----------
 
 def embed(text):
-    r = requests.post(f"{OLLAMA}/api/embed",
-                      json={"model": EMBED_MODEL, "input": [text], "keep_alive": EMBED_KEEP_ALIVE},
-                      timeout=120)
-    r.raise_for_status()
-    return r.json()["embeddings"][0]
+    with observation("ollama embed", "embedding", input=text, model=EMBED_MODEL,
+                     operation="embeddings") as span:
+        r = requests.post(f"{OLLAMA}/api/embed",
+                          json={"model": EMBED_MODEL, "input": [text], "keep_alive": EMBED_KEEP_ALIVE},
+                          timeout=120)
+        r.raise_for_status()
+        body = r.json()
+        set_ollama_response(span, body)
+        vector = body["embeddings"][0]
+        set_output(span, {"dimensions": len(vector)})
+        return vector
 
 
 def to_vector(values):
     return "[" + ",".join(str(x) for x in values) + "]"
 
 
+# ---------- Prompt Guard ----------
+
+PROMPT_GUARD_MAX_CHARS = 20000  # the classifier answers 413 above this (MAX_CHARS in apps/prompt-guard)
+
+
+def _pieces(text):
+    """Split very long text into overlapping pieces the classifier accepts; the highest score wins."""
+    if len(text) <= PROMPT_GUARD_MAX_CHARS:
+        return [text]
+    step = PROMPT_GUARD_MAX_CHARS - 1000
+    return [text[i:i + PROMPT_GUARD_MAX_CHARS] for i in range(0, len(text), step)]
+
+
+def classify(text, stage, tool):
+    """Classify one text with Prompt Guard inside a guardrail span. Returns (blocked, score).
+
+    Raises ToolError if Prompt Guard cannot be reached and PROMPT_GUARD_FAIL_OPEN is false.
+    """
+    with observation(f"prompt-guard {stage}", "guardrail",
+                     input={"tool": tool, "stage": stage, "text": text},
+                     **{"prompt_guard.stage": stage, "prompt_guard.tool": tool,
+                        "prompt_guard.threshold": PROMPT_GUARD_THRESHOLD}) as span:
+        try:
+            result = None
+            for piece in _pieces(text):
+                r = requests.post(PROMPT_GUARD_URL, json={"text": piece, "threshold": PROMPT_GUARD_THRESHOLD},
+                                  timeout=15)
+                r.raise_for_status()
+                part = r.json()
+                if result is None or float(part["malicious_score"]) > float(result["malicious_score"]):
+                    result = part
+            score = float(result["malicious_score"])
+        except (requests.RequestException, ValueError, KeyError) as e:
+            span.set_attribute("prompt_guard.error", f"{type(e).__name__}: {e}")
+            span.set_attribute("langfuse.observation.level", "ERROR")
+            if PROMPT_GUARD_FAIL_OPEN:
+                set_output(span, {"error": str(e), "action": "allowed (fail open)"})
+                return False, None
+            set_output(span, {"error": str(e), "action": "refused (fail closed)"})
+            raise ToolError(f"Prompt Guard unavailable, request refused: {type(e).__name__}") from e
+        blocked = score >= PROMPT_GUARD_THRESHOLD
+        span.set_attribute("prompt_guard.malicious_score", score)
+        span.set_attribute("prompt_guard.label", str(result.get("label", "")))
+        span.set_attribute("prompt_guard.blocked", blocked)
+        span.set_attribute("prompt_guard.latency_ms", float(result.get("latency_ms") or 0.0))
+        span.set_attribute("langfuse.observation.metadata.malicious_score", f"{score:.4f}")
+        span.set_attribute("langfuse.observation.metadata.blocked", str(blocked).lower())
+        if blocked:
+            span.set_attribute("langfuse.observation.level", "WARNING")
+            span.set_attribute("langfuse.observation.status_message",
+                               f"malicious_score {score:.4f} >= threshold {PROMPT_GUARD_THRESHOLD}")
+        set_output(span, {**result, "threshold": PROMPT_GUARD_THRESHOLD, "blocked": blocked})
+        return blocked, score
+
+
+def guard_input(tool, **arguments):
+    """Refuse the tool call if its user-supplied text looks like a prompt attack."""
+    if not PROMPT_GUARD_ENABLED:
+        return
+    text = "\n".join(str(v) for v in arguments.values() if isinstance(v, str) and v.strip())
+    if not text:
+        return
+    blocked, score = classify(text, "input", tool)
+    if blocked:
+        raise ToolError(
+            f"Refused by Prompt Guard: the {tool} arguments look like a prompt injection or jailbreak "
+            f"(malicious_score {score:.3f} >= threshold {PROMPT_GUARD_THRESHOLD})."
+        )
+
+
+def guard_chunks(tool, results):
+    """Withhold retrieved chunks that look like indirect prompt injection."""
+    if not PROMPT_GUARD_ENABLED:
+        return results, 0
+    withheld = 0
+    for item in results:
+        blocked, score = classify(item["chunk"], "retrieved_chunk", tool)
+        if blocked:
+            withheld += 1
+            item["chunk"] = (f"[withheld by Prompt Guard: malicious_score {score:.3f} >= "
+                             f"threshold {PROMPT_GUARD_THRESHOLD}]")
+            item["withheld"] = True
+    return results, withheld
+
+
+def traced_tool(func):
+    """Add the tool's arguments and result to the SDK's "tools/call" span.
+
+    The MCP SDK already opens a span per tool call with gen_ai.operation.name=execute_tool,
+    which Langfuse shows as a TOOL observation, but without input or output. This fills them in
+    and names the trace. functools.wraps keeps the signature and docstring, which the SDK reads
+    to build the tool's input schema.
+    """
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        span = trace.get_current_span()
+        span.set_attribute("langfuse.observation.input", _text(kwargs))
+        span.set_attribute("langfuse.trace.name", f"mcp {func.__name__}")
+        result = func(*args, **kwargs)
+        set_output(span, result)
+        return result
+    return wrapper
+
+
 @mcp.tool()
+@traced_tool
 def search_notes(query: str, k: int = 5) -> dict[str, Any]:
     """Search the ai-ops-homelab lab notes by meaning.
 
@@ -72,6 +204,7 @@ def search_notes(query: str, k: int = 5) -> dict[str, Any]:
     if not query.strip():
         raise ToolError("query must not be empty")
     k = max(1, min(int(k), 20))
+    guard_input("search_notes", query=query)
     try:
         qvec = to_vector(embed("search_query: " + query))  # nomic-embed-text task prefix, as in ask.py
         with psycopg.connect(DSN, connect_timeout=5) as conn, conn.cursor() as cur:
@@ -84,13 +217,11 @@ def search_notes(query: str, k: int = 5) -> dict[str, Any]:
     except (requests.RequestException, psycopg.Error) as e:
         # Surface backend problems (Ollama or Postgres unreachable) to the caller.
         raise ToolError(f"search_notes backend error: {type(e).__name__}: {e}") from e
-    return {
-        "query": query,
-        "results": [
-            {"source": source, "distance": round(float(distance), 4), "chunk": chunk}
-            for source, chunk, distance in rows
-        ],
-    }
+    results, withheld = guard_chunks("search_notes", [
+        {"source": source, "distance": round(float(distance), 4), "chunk": chunk}
+        for source, chunk, distance in rows
+    ])
+    return {"query": query, "withheld": withheld, "results": results}
 
 
 # ---------- fo_*: read-only OData against the mock FO service ----------
@@ -129,6 +260,7 @@ def _check_entity(entity):
 
 
 @mcp.tool()
+@traced_tool
 def fo_list_entities() -> dict[str, Any]:
     """List the entity sets (for example CustomersV3) that the mock FO OData service exposes."""
     sets, _ = _metadata()
@@ -136,9 +268,11 @@ def fo_list_entities() -> dict[str, Any]:
 
 
 @mcp.tool()
+@traced_tool
 def fo_get_entity_metadata(entity: str) -> dict[str, Any]:
     """Return the key fields and all field names/types for one FO entity set, read from /data/$metadata."""
     _check_entity(entity)
+    guard_input("fo_get_entity_metadata", entity=entity)
     sets, types = _metadata()
     if entity not in sets:
         raise ToolError(f"Unknown entity set {entity}. Known: {', '.join(sorted(sets))}")
@@ -147,6 +281,7 @@ def fo_get_entity_metadata(entity: str) -> dict[str, Any]:
 
 
 @mcp.tool()
+@traced_tool
 def fo_query(entity: str, filter: str | None = None, top: int = 10,
              select: str | None = None, cross_company: bool = False) -> dict[str, Any]:
     """Read records from a mock Dynamics 365 FO OData entity set (fake demo data).
@@ -157,6 +292,7 @@ def fo_query(entity: str, filter: str | None = None, top: int = 10,
     cross_company: true to include companies other than the default (usmf).
     """
     _check_entity(entity)
+    guard_input("fo_query", entity=entity, filter=filter, select=select)
     params = {"$top": str(max(1, min(int(top), 50))), "$count": "true"}
     if filter:
         params["$filter"] = filter
