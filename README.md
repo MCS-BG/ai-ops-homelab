@@ -1,6 +1,8 @@
 # ai-ops-homelab
 
-Sovereign Super Intelligence. Each business keeps control of its own model, data, tools, and the loop that is allowed to call them. The lab runs that system on k3s: a local model on a small GPU, RAG that only supplies evidence, an MCP server for tools, a chat UI that is not the agent loop, observability, and prompt-injection guardrails that fail closed. The same patterns are practised here before they are used on AKS and EKS.
+Sovereign Super Intelligence is a home lab for running and operating local AI on Kubernetes, built one day at a time. The point of the system is that a business keeps control of its own model, data, tools, and the loop that is allowed to call them.
+
+It uses k3s, a local model on a small GPU, RAG that only supplies evidence, a chat UI that is not the agent loop, an MCP server for tools, observability, and prompt-injection guardrails that fail closed. The same patterns are practised here before they are used on AKS and EKS.
 
 ## The three machines
 
