@@ -1,9 +1,6 @@
 # ai-ops-homelab
 
-A home lab for running and operating local AI on Kubernetes, built one day at a time. It uses k3s,
-a local LLM on a small GPU, RAG over the lab notes, a chat UI, an MCP server, observability, and
-prompt-injection guardrails. The aim is to practise the same patterns used on AKS and EKS, on
-hardware at home.
+Sovereign Super Intelligence. Each business keeps control of its own model, data, tools, and the loop that is allowed to call them. The lab runs that system on k3s: a local model on a small GPU, RAG that only supplies evidence, an MCP server for tools, a chat UI that is not the agent loop, observability, and prompt-injection guardrails that fail closed. The same patterns are practised here before they are used on AKS and EKS.
 
 ## The three machines
 
